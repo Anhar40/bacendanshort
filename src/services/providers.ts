@@ -408,6 +408,13 @@ class ProviderService {
 
   async episode(provider: DramaProviderId, externalId: string, episodeNum: number, requestOrigin?: string): Promise<EpisodeSummary> {
     if (provider === 'moviebox') {
+      // Jalur cepat untuk film: bila detail ter-cache (valid/stale) menunjukkan
+      // subjectType=1, langsung pakai jalur film — `get-download-url` memang khusus
+      // seri dan tiga percobaan via queue bisa makan waktu puluhan detik.
+      if (await this.movieboxDetailIsFilm(externalId)) {
+        const filmEp = await this.movieboxFilmEpisode(externalId, episodeNum, requestOrigin);
+        if (filmEp) return filmEp;
+      }
       // Film (subjectType=1) TIDAK punya season → upstream minta `season=0` (balasan
       // "Film ini tidak memiliki season. Gunakan season = 0."). Seri pakai season=1.
       // Coba beberapa kombinasi; hanya hasil yang benar-benar berisi stream di-cache.
@@ -462,6 +469,19 @@ class ProviderService {
         if (err instanceof ContentUnavailableError) {
           resolveError = err;
         } else {
+          // Infrastruktur gagal (upstream 502/down) → coba stream yang pernah
+          // tersimpan di DB (replay/continue-watching) sebelum menyerah.
+          const saved = await this.savedStreamUrl('moviebox', externalId, episodeNum, requestOrigin);
+          if (saved) {
+            return {
+              id: `${externalId}:se1ep${episodeNum}`,
+              number: episodeNum,
+              title: `Episode ${episodeNum}`,
+              cover: '',
+              streamUrl: saved,
+              subtitles: [],
+            };
+          }
           throw err;
         }
       }
@@ -479,6 +499,17 @@ class ProviderService {
         // ada di `detail.resourceDetectors[].resolutionList[].resourceLink` (MP4 signed).
         const filmEp = await this.movieboxFilmEpisode(externalId, episodeNum, requestOrigin);
         if (filmEp) return filmEp;
+        const saved = await this.savedStreamUrl('moviebox', externalId, episodeNum, requestOrigin);
+        if (saved) {
+          return {
+            id: `${externalId}:se1ep${episodeNum}`,
+            number: episodeNum,
+            title: `Episode ${episodeNum}`,
+            cover: '',
+            streamUrl: saved,
+            subtitles: [],
+          };
+        }
         throw resolveError ?? new ContentUnavailableError(externalId);
       }
       // Bungkus lewat `proxy-video` (alur resmi app moviebox) → URL `cdn-proxy`
@@ -527,7 +558,7 @@ class ProviderService {
       return ep;
     }
     if (provider === 'melolo') {
-      const streamUrl = await this.meloloEpisodeStream(externalId, episodeNum);
+      const streamUrl = await this.meloloEpisodeStream(externalId, episodeNum, requestOrigin);
       if (!streamUrl) throw new ContentUnavailableError(externalId);
       return {
         id: `${externalId}:ep${episodeNum}`,
@@ -539,20 +570,37 @@ class ProviderService {
       };
     }
     if (provider === 'pinedrama') {
-      const raw = await cacheService.getOrFetch<PineEpisode>(
-        `pinedrama:episode:${externalId}:${episodeNum}`,
-        'get-episode',
-        config.DETAIL_TTL,
-        async () =>
-          (
-            await externalApiService.request<PineEpisode>('pinedrama', 'get-episode', {
-              collection_id: externalId,
-              episodeNumber: String(episodeNum),
-            })
-          ).data,
-        { collection_id: externalId, episodeNumber: String(episodeNum) },
-        'pinedrama',
-      );
+      let raw: PineEpisode | undefined;
+      try {
+        raw = await cacheService.getOrFetch<PineEpisode>(
+          `pinedrama:episode:${externalId}:${episodeNum}`,
+          'get-episode',
+          config.DETAIL_TTL,
+          async () =>
+            (
+              await externalApiService.request<PineEpisode>('pinedrama', 'get-episode', {
+                collection_id: externalId,
+                episodeNumber: String(episodeNum),
+              })
+            ).data,
+          { collection_id: externalId, episodeNumber: String(episodeNum) },
+          'pinedrama',
+        );
+      } catch (err) {
+        // Upstream pinedrama down → layani stream yang pernah tersimpan di DB.
+        const saved = await this.savedStreamUrl('pinedrama', externalId, episodeNum, requestOrigin);
+        if (saved) {
+          return {
+            id: `${externalId}:ep${episodeNum}`,
+            number: episodeNum,
+            title: `Episode ${episodeNum}`,
+            cover: '',
+            streamUrl: saved,
+            subtitles: [],
+          };
+        }
+        throw err;
+      }
       const groups = [raw?.best_url, raw?.main, raw?.alt]
         .filter((g): g is string | PineCdnGroup => !!g)
         .flatMap((g) => (typeof g === 'string' ? [g] : [...(g.indo_hd_cdn_urls ?? []), ...(g.indo_cdn_urls ?? []), ...(g.cdn_urls ?? [])]));
@@ -728,7 +776,7 @@ class ProviderService {
    * Stream episode Melolo: cari `vid` episode itu dari detail (cache), lalu panggil
    * endpoint `episode` dengan `videoId`. Fallback: inline stream bila ada.
    */
-  private async meloloEpisodeStream(externalId: string, episodeNum: number): Promise<string> {
+  private async meloloEpisodeStream(externalId: string, episodeNum: number, requestOrigin?: string): Promise<string> {
     const detail = await cacheService.getOrFetch<MeloloObject | undefined>(
       `melolo:detail:${externalId}`,
       'detail',
@@ -751,15 +799,63 @@ class ProviderService {
       if (typeof vid === 'string' || typeof vid === 'number') videoId = String(vid);
     }
     if (!videoId) return '';
-    const raw = await cacheService.getOrFetch<MeloloObject | undefined>(
-      `melolo:episode:${videoId}`,
-      'get-episode',
-      config.DETAIL_TTL,
-      async () => (await externalApiService.request<MeloloObject | undefined>('melolo', 'get-episode', { videoId })).data,
-      { videoId },
-      'melolo',
-    );
+    let raw: MeloloObject | undefined;
+    try {
+      raw = await cacheService.getOrFetch<MeloloObject | undefined>(
+        `melolo:episode:${videoId}`,
+        'get-episode',
+        config.DETAIL_TTL,
+        async () => (await externalApiService.request<MeloloObject | undefined>('melolo', 'get-episode', { videoId })).data,
+        { videoId },
+        'melolo',
+      );
+    } catch (err) {
+      // Upstream melolo sedang down (502 via Cloudflare) → layani stream yang
+      // pernah tersimpan di DB bila ada.
+      const saved = await this.savedStreamUrl('melolo', externalId, episodeNum, requestOrigin);
+      if (saved) return saved;
+      throw err;
+    }
     return meloloStreamUrl(raw) || '';
+  }
+
+  /**
+   * Stream URL yang pernah tersimpan di DB (episode pernah diputar / continue-watching).
+   * Dipakai saat upstream down (502) agar replay tetap jalan. URL proxy sendiri
+   * (moviebox) di-rewrite ke host penelepon saat itu biar kebetulan host lama berbeda.
+   */
+  private async savedStreamUrl(provider: DramaProviderId, externalId: string, episodeNum: number, requestOrigin?: string): Promise<string> {
+    try {
+      const drama = await prisma.drama.findUnique({
+        where: { provider_externalId: { provider, externalId } },
+        select: { id: true },
+      });
+      if (!drama) return '';
+      const ep = await prisma.episode.findFirst({
+        where: { dramaId: drama.id, episodeNumber: episodeNum },
+        select: { videoUrl: true },
+      });
+      const url = ep?.videoUrl ?? '';
+      if (url && requestOrigin && /\/api\/(?:moviebox\/)?(?:cdn-proxy|proxy-video)/.test(url)) {
+        return this.rewriteSelfHost(url, requestOrigin);
+      }
+      return url;
+    } catch {
+      return '';
+    }
+  }
+
+  /** Re-host URL yang mengarah ke backend kita sendiri ke origin penelepon. */
+  private rewriteSelfHost(url: string, requestOrigin: string): string {
+    try {
+      const u = new URL(url);
+      const o = new URL(requestOrigin);
+      u.protocol = o.protocol;
+      u.host = o.host;
+      return u.toString();
+    } catch {
+      return url;
+    }
   }
 
   // ----- helpers MovieBox (dari CONTOHEXECUTE/moviebox — SOURCE OF TRUTH) -----
@@ -936,6 +1032,23 @@ class ProviderService {
     }
     // Fallback: bicara langsung ke CDN (sacdn) dengan cookie server-side.
     return buildProxy(rawUrl, signCookie);
+  }
+
+  /**
+   * Baca detail ter-cache apa pun statusnya (valid/stale) untuk tahu apakah konten
+   * adalah film MovieBox (subjectType=1). Tidak menyentuh jaringan.
+   */
+  private async movieboxDetailIsFilm(externalId: string): Promise<boolean> {
+    try {
+      const row = await prisma.apiCache.findUnique({
+        where: { provider_cacheKey: { provider: 'moviebox', cacheKey: `moviebox:detail:v2:${externalId}` } },
+        select: { responseData: true },
+      });
+      if (!row) return false;
+      return movieBoxPick((row.responseData as MovieBoxObject | null) ?? undefined, ['subjectType'], '') === '1';
+    } catch {
+      return false;
+    }
   }
 
   /**

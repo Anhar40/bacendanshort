@@ -162,15 +162,31 @@ class ExternalApiService {
    * Fetch ke target URL. Bila `SCRAPERAPI_API_KEY` terisi → lewat ScraperAPI
    * (rotasi IP terkelola, IP lokal tidak lagi dipakai ke upstream). Tanpa key →
    * jalur langsung (IP lokal — rawan diblacklist upstream).
+   *
+   * Kadang ScraperAPI MENOLAK mengambil target ("Request failed... Protected
+   * domains may require adding premium=true") — itu BUKAN status upstream,
+   * melainkan penolakan proxy. Dalam kasus itu fallback sekali ke jalur langsung
+   * agar layanan tetap jalan (risiko blacklist IP ditanggung).
    */
-  private fetchTarget(url: URL, headers: Record<string, string>): Promise<Response> {
-    if (config.SCRAPERAPI_API_KEY) {
-      const target = new URL('https://api.scraperapi.com/');
-      target.searchParams.set('api_key', config.SCRAPERAPI_API_KEY);
-      target.searchParams.set('url', url.toString());
-      return undiciFetch(target, { headers: { Accept: headers.Accept ?? 'application/json, text/plain, */*' } });
+  private async fetchTarget(url: URL, headers: Record<string, string>): Promise<Response> {
+    if (!config.SCRAPERAPI_API_KEY) return undiciFetch(url, { headers });
+    const target = new URL('https://api.scraperapi.com/');
+    target.searchParams.set('api_key', config.SCRAPERAPI_API_KEY);
+    target.searchParams.set('url', url.toString());
+    const proxyRes = await undiciFetch(target, { headers });
+    if (await this.isScraperRefusal(proxyRes)) {
+      console.warn(`[external] ScraperAPI menolak ${url.host}${url.pathname} → fallback langsung`);
+      return undiciFetch(url, { headers });
     }
-    return undiciFetch(url, { headers });
+    return proxyRes;
+  }
+
+  /** ScraperAPI menolak fetch (bukan status upstream): 500 + pesan khas proxy gagal. */
+  private async isScraperRefusal(res: Response): Promise<boolean> {
+    if (res.status !== 500) return false;
+    const probe = res.clone();
+    const text = await probe.text().catch(() => '');
+    return /Request failed|You will not be charged|Protected domains|premium(?:=|\s)true/i.test(text);
   }
 
   private async fetchLive<T>(

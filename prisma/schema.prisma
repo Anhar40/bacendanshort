@@ -1,0 +1,152 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String         @id @default(cuid())
+  username     String?
+  email        String?        @unique
+  passwordHash String?
+  avatar       String?
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+  favorites    Favorite[]
+  watchHistory WatchHistory[]
+}
+
+model Drama {
+  id                 String           @id @default(cuid())
+  provider           String           @default("freereels")
+  externalId         String           @map("external_id")
+  title              String
+  slug               String?
+  description        String?
+  posterUrl          String?          @map("poster_url")
+  coverUrl           String?          @map("cover_url")
+  category           String?
+  type               String?
+  status             String?
+  rating             String?
+  releaseYear        Int?             @map("release_year")
+  totalEpisodes      Int?             @map("total_episodes")
+  viewCount          BigInt?          @map("view_count")
+  followCount        BigInt?          @map("follow_count")
+  finishStatus       Int?             @map("finish_status")
+  free               Boolean?
+  externalData       Json?            @map("external_data")
+  cachedAt           DateTime?        @map("cached_at")
+  expiresAt          DateTime?        @map("expires_at")
+  lastFetchedAt      DateTime?        @map("last_fetched_at")
+  lastRefreshStatus  String?          @map("last_refresh_status")
+  refreshAttempt     Int?             @default(0) @map("refresh_attempt")
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt
+  episodes           Episode[]
+  categories         DramaCategory[]
+  favorites          Favorite[]
+  watchHistory       WatchHistory[]
+
+  @@map("dramas")
+  @@unique([provider, externalId])
+}
+
+model Episode {
+  id             String   @id @default(cuid())
+  dramaId        String   @map("drama_id")
+  externalEpId   String   @map("external_episode_id")
+  episodeNumber  Int      @map("episode_number")
+  title          String
+  thumbnailUrl   String?  @map("thumbnail_url")
+  videoUrl       String?  @map("video_url")
+  h264M3u8Url    String?  @map("h264_m3u8_url")
+  h265M3u8Url    String?  @map("h265_m3u8_url")
+  duration       Int?
+  subtitleList   Json?    @map("subtitle_list")
+  externalData   Json?    @map("external_data")
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  drama          Drama    @relation(fields: [dramaId], references: [id], onDelete: Cascade)
+  watchHistory   WatchHistory[]
+
+  @@unique([dramaId, externalEpId])
+  @@index([dramaId, episodeNumber])
+  @@map("episodes")
+}
+
+model Category {
+  id        String           @id @default(cuid())
+  name      String
+  slug      String?          @unique
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @updatedAt
+  dramas    DramaCategory[]
+
+  @@map("categories")
+}
+
+model DramaCategory {
+  dramaId    String   @map("drama_id")
+  categoryId String   @map("category_id")
+  drama      Drama    @relation(fields: [dramaId], references: [id], onDelete: Cascade)
+  category   Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@id([dramaId, categoryId])
+  @@map("drama_categories")
+}
+
+model ApiCache {
+  id                String   @id @default(cuid())
+  provider          String   @default("freereels")
+  cacheKey          String   @map("cache_key")
+  endpoint          String
+  requestParams     Json?    @map("request_params")
+  responseData      Json?    @map("response_data")
+  cachedAt          DateTime @default(now()) @map("cached_at")
+  expiresAt         DateTime @map("expires_at")
+  status            String   @default("fresh")
+  lastRefreshStatus String?  @default("ok") @map("last_refresh_status")
+  refreshAttempt    Int      @default(0) @map("refresh_attempt")
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@unique([provider, cacheKey])
+  @@index([expiresAt])
+  @@map("api_cache")
+}
+
+model WatchHistory {
+  id              String   @id @default(cuid())
+  userId          String   @map("user_id")
+  provider        String   @default("freereels")
+  dramaId         String   @map("drama_id")
+  episodeId       String   @map("episode_id")
+  progressSeconds Int      @default(0) @map("progress_seconds")
+  durationSeconds Int?     @map("duration_seconds")
+  completed       Boolean  @default(false)
+  lastWatchedAt   DateTime @default(now()) @map("last_watched_at")
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  drama           Drama    @relation(fields: [dramaId], references: [id], onDelete: Cascade)
+  episode         Episode  @relation(fields: [episodeId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, provider, episodeId])
+  @@index([userId, provider, lastWatchedAt])
+  @@map("watch_history")
+}
+
+model Favorite {
+  id        String   @id @default(cuid())
+  userId    String   @map("user_id")
+  provider  String   @default("freereels")
+  dramaId   String   @map("drama_id")
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  drama     Drama    @relation(fields: [dramaId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, provider, dramaId])
+  @@map("favorites")
+}

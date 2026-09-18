@@ -4,7 +4,10 @@
  * Alur resmi app moviebox: `get-download-url` → `proxy-video` → `cdn-proxy`.
  * Mobile HANYA boleh request ke backend kita, jadi route ini:
  *
- *   1. Menerima `?url=<CDN target>&c=<signCookie>`.
+ *   1. Menerima `?url=<CDN target>` + auth cookie: `&c=<signCookie>` (raw) atau
+ *      `&u=<token pendek>` (token cookie yang disimpan server-side). Token
+ *      membuat URL tetap pendek — cookie raw (~600 char) di URL panjang
+ *      terbukti tidak andal di stack client.
  *   2. Fetch langsung ke CDN content (`*.hakunaymatata.com`) DENGAN cookie
  *      CloudFront (via header `Cookie`) server-side — mobile tidak pernah
  *      memegang cookie maupun menyentuh CDN/host API upstream.
@@ -24,6 +27,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { Readable } from 'node:stream';
 import { config } from '../config.js';
+import { getSignCookieByToken, setSignCookieToken } from '../services/movieboxCookieStore.js';
 
 const CDN_HOST_SUFFIX = 'hakunaymatata.com';
 const TEXTUAL_CT = /text\/|html|xml|json|mpegurl|subrip|utf-8/i;
@@ -48,6 +52,11 @@ export function movieboxProxyRoute(app: FastifyInstance): void {
     }
 
     const cookie = q.c ?? undefined;
+    // Token pendek (`&u=`) → cookie. Kalau request lama membawa cookie raw, kita
+    // token-kan juga supaya URL segmen yang di-rewrite tetap pendek.
+    const token = q.u ?? (cookie ? setSignCookieToken(cookie) : undefined);
+    const resolvedCookie = token ? (getSignCookieByToken(token) ?? cookie) : cookie || undefined;
+    const segAuth = token ? `&u=${encodeURIComponent(token)}` : '';
     const accept = req.headers.accept ?? '*/*';
     const range = req.headers.range;
     const contentType = q.t ?? undefined;
@@ -55,7 +64,7 @@ export function movieboxProxyRoute(app: FastifyInstance): void {
     const isTextual = (contentType && TEXTUAL_CT.test(contentType)) || isManifestPath;
     const forceScraper = q.scrape === '1';
 
-    const upRes = await fetchUpstream(target, accept, range, cookie, { binary: !isTextual, forceScraper });
+    const upRes = await fetchUpstream(target, accept, range, resolvedCookie, { binary: !isTextual, forceScraper });
     if (!upRes.ok) {
       const buf = Buffer.from(await upRes.arrayBuffer());
       copyHeaders(upRes, reply);
@@ -72,7 +81,7 @@ export function movieboxProxyRoute(app: FastifyInstance): void {
       }
       const selfOrigin = getSelfOrigin(req);
       const body = isManifestPath
-        ? rewriteDashSegments(text, selfOrigin, parsed, cookie)
+        ? rewriteDashSegments(text, selfOrigin, parsed, segAuth)
         : rewriteHosts(text, hostname, selfOrigin);
       return reply.type(upContentType || 'application/xml').send(body);
     }
@@ -172,15 +181,14 @@ function rewriteHosts(body: string, upstreamHost: string, selfOrigin: string): s
  *     hanya berisi karakter yang aman di query string: alphanumeric,
  *     `.`, `-`, `_`, `$`, `%`.
  * ═══════════════════════════════════════════════════════════════════════════════ */
-function rewriteDashSegments(body: string, selfOrigin: string, manifestUrl: URL, cookie?: string): string {
+function rewriteDashSegments(body: string, selfOrigin: string, manifestUrl: URL, segAuth: string): string {
   const dir = `${manifestUrl.origin}${manifestUrl.pathname.slice(0, manifestUrl.pathname.lastIndexOf('/') + 1)}`;
   const dirEnc = encodeURIComponent(dir);
-  const cookieQ = cookie ? `&c=${encodeURIComponent(cookie)}` : '';
   const prefix = `${selfOrigin}/api/moviebox/cdn-proxy?url=${dirEnc}`;
 
   const replace = (_m: string, p1: string, value: string, p3: string) => {
     if (value.includes('://')) return `${p1}${value}${p3}`;
-    return `${p1}${prefix}${value}${cookieQ}${p3}`;
+    return `${p1}${prefix}${value}${segAuth}${p3}`;
   };
   return body.replace(/((?:initialization|media|avcUrl|hevcUrl|url)=")([^"]+)(")/g, replace);
 }

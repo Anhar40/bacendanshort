@@ -13,6 +13,7 @@ import { config } from '../config.js';
 import { prisma } from '../db.js';
 import { Prisma } from '@prisma/client';
 import { cacheService } from './cacheService.js';
+import { setSignCookieToken } from './movieboxCookieStore.js';
 import { externalApiService, ContentUnavailableError } from './externalApiService.js';
 import { upsertDramasFromFeed } from './dramaService.js';
 import type { DramaDetail, DramaSummary, EpisodeSummary, FeedEnvelope } from './dramaService.js';
@@ -996,7 +997,9 @@ class ProviderService {
     const selfBase = requestOrigin ?? config.PUBLIC_BASE_URL ?? 'http://localhost:3000';
     const buildProxy = (target: string, cookie?: string) => {
       let url = `${selfBase}/api/moviebox/cdn-proxy?url=${encodeURIComponent(target)}`;
-      if (cookie) url += `&c=${encodeURIComponent(cookie)}`;
+      // Cookie disimpan server-side; URL hanya membawa token pendek (`&u=`)
+      // supaya panjang query wajar (cookie raw ~600 char tidak andal).
+      if (cookie) url += `&u=${setSignCookieToken(cookie)}`;
       return url;
     };
     // Proxy-video (alur resmi app moviebox) → `download_url` (`cdn-proxy` di domain upstream).
@@ -1018,10 +1021,22 @@ class ProviderService {
       if (proxy && typeof proxy.download_url === 'string' && proxy.download_url.startsWith('http')) {
         try {
           const u = new URL(proxy.download_url);
-          const selfHost = new URL(selfBase).host;
-          if (u.host !== selfHost) u.host = selfHost;
-          // Pastikan ada param c (cookie) dari asal proxy-video (download_url asli tidak mengandungnya)
-          if (signCookie && !u.searchParams.has('c')) u.searchParams.set('c', signCookie);
+          const selfUrl = new URL(selfBase);
+          // Rewire host DAN scheme ke domain kita — download_url upstream
+          // ber-scheme https (api.sansekai.my.id); kalau backend kita plain
+          // http, scheme https itu membuat player mati (ERR_SSL ke port http).
+          if (u.host !== selfUrl.host) {
+            u.protocol = selfUrl.protocol;
+            u.host = selfUrl.host;
+          }
+          // Auth cookie dari proxy-video: supaya URL tetap pendek, cookie di-token-kan
+          // (`u=`), bukan dibawa raw (`c=`) di query.
+          const existingCookie = u.searchParams.get('c');
+          const cookieForToken = existingCookie ?? signCookie;
+          if (cookieForToken) {
+            u.searchParams.set('u', setSignCookieToken(cookieForToken));
+            u.searchParams.delete('c');
+          }
           return u.toString();
         } catch {
           // download_url parse gagal — fallback

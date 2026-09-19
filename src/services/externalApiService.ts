@@ -72,6 +72,31 @@ const RETRY_BACKOFF_MS = [500, 1500];
 /** Lama "istirahat" satu (provider,endpoint) setelah upstream kena gangguan sementara. */
 const UPSTREAM_COOLDOWN_MS = 60_000;
 
+/**
+ * Kumpulan User-Agent modern (2026). Dipilih acak per request agar tidak
+ * terlihat sebagai bot tunggal oleh WAF upstream.
+ */
+const USER_AGENTS = [
+  // Chrome Desktop — Windows
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+  // Chrome Desktop — macOS
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+  // Microsoft Edge (Chromium) — Windows
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36 Edg/138.0.0.0',
+  // Safari — macOS
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15',
+  // Safari — iOS
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1',
+  // Chrome Mobile — Android
+  'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36',
+  // Chrome Mobile — Android (Samsung)
+  'Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36',
+];
+
+function getRandomUserAgent(): string {
+  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -133,17 +158,27 @@ class ExternalApiService {
 
   /**
    * Ambil data mentah dari API eksternal provider (atau fixture).
-   * Memakai key tunggal per provider+endpoint untuk antrean + rate limit + single-flight.
+   * `clientIp` opsional — untuk rate-limit/identitas per-user. Dimasukkan ke key
+   * single-flight agar request antar-user dengan params serupa tidak berbagi
+   * satu fetch (per-user dedup, bukan global).
    */
-  request<T>(provider: DramaProviderId, endpoint: string, params: Record<string, string> = {}): Promise<ExternalEnvelope<T>> {
-    const key = `${provider}:${endpoint}?${new URLSearchParams(params).toString()}`;
-    return this.singleFlight(key, () => this.enqueue(() => this.doRequest<T>(provider, endpoint, params)));
+  request<T>(
+    provider: DramaProviderId,
+    endpoint: string,
+    params: Record<string, string> = {},
+    clientIp?: string,
+  ): Promise<ExternalEnvelope<T>> {
+    const key = `${provider}:${endpoint}${clientIp ? `:${clientIp}` : ''}?${new URLSearchParams(params).toString()}`;
+    return this.singleFlight(key, () =>
+      this.enqueue(() => this.doRequest<T>(provider, endpoint, params, clientIp)),
+    );
   }
 
   private async doRequest<T>(
     provider: DramaProviderId,
     endpoint: string,
     params: Record<string, string>,
+    clientIp?: string,
   ): Promise<ExternalEnvelope<T>> {
     if (config.useFixture) {
       return this.readFixture<T>(provider, endpoint, params);
@@ -155,7 +190,7 @@ class ExternalApiService {
         `Upstream ${provider}/${endpoint} sedang cooldown (${Math.ceil((until - Date.now()) / 1000)}s tersisa)`,
       );
     }
-    return this.fetchLive<T>(provider, endpoint, params);
+    return this.fetchLive<T>(provider, endpoint, params, clientIp);
   }
 
   /**
@@ -173,6 +208,9 @@ class ExternalApiService {
     const target = new URL('https://api.scraperapi.com/');
     target.searchParams.set('api_key', config.SCRAPERAPI_API_KEY);
     target.searchParams.set('url', url.toString());
+    // Pertahankan header kustom (X-Forwarded-For, User-Agent, dst.) agar tidak
+    // dibuang oleh proxy ScraperAPI.
+    target.searchParams.set('keep_headers', 'true');
     const proxyRes = await undiciFetch(target, { headers });
     if (await this.isScraperRefusal(proxyRes)) {
       console.warn(`[external] ScraperAPI menolak ${url.host}${url.pathname} → fallback langsung`);
@@ -193,6 +231,7 @@ class ExternalApiService {
     provider: DramaProviderId,
     endpoint: string,
     params: Record<string, string>,
+    clientIp?: string,
   ): Promise<ExternalEnvelope<T>> {
     let url: URL;
     if (provider === 'pinedrama') {
@@ -217,15 +256,22 @@ class ExternalApiService {
 
     let lastError: unknown = new Error(`External API gagal untuk ${provider}/${endpoint}`);
     // Header mirip browser: WAF upstream sering membalas 404/403 untuk UA bot (node).
-    const headers = {
-      'User-Agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    // UA diacak per request (rotasi User-Agent) untuk menghindari pola bot tunggal.
+    const headers: Record<string, string> = {
+      'User-Agent': getRandomUserAgent(),
       Accept: 'application/json, text/plain, */*',
       'Accept-Language': 'en-US,en;q=0.9,id;q=0.8',
       // Referer serendah-rendahnya: root host API sendiri (bukan situs lain),
       // membantu WAF kalau ia memvalidasi keberadaan referer per path.
       Referer: `${url.origin}/`,
     };
+    // Info klien asli diteruskan sebagai header spoof web-server biasa; berguna
+    // untuk per-user rate limit upstream dan melewati WAF yang mencurigai IP.
+    if (clientIp) {
+      headers['X-Forwarded-For'] = clientIp;
+      headers['X-Real-IP'] = clientIp;
+      headers['Client-IP'] = clientIp;
+    }
     for (let attempt = 0; attempt <= RETRY_BACKOFF_MS.length; attempt++) {
       let res: Response;
       try {

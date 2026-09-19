@@ -18,6 +18,10 @@ export function buildApp(): FastifyInstance {
             options: { translateTime: 'SYS:HH:MM:ss', singleLine: true },
           },
         },
+    // Di belakang TLS-terminating proxy (Abasthan/Cloudflare), `req.protocol` harus
+    // menghormati `X-Forwarded-Proto` agar URL streaming yang kita bangun pakai
+    // https (bukan http) — tanpa ini player Android menolak URL cleartext.
+    trustProxy: true,
   });
 
   void app.register(cors, { origin: true });

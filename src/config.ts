@@ -4,7 +4,6 @@ import path from 'node:path';
 import fs from 'node:fs';
 
 dotenv.config();
-// Konvensi repo: nilai bisa ditaruh di backend/.env atau root ../.env (mis. EXTERNAL_API_BASE_URL).
 try {
   dotenv.config({ path: path.resolve(process.cwd(), '../.env'), override: false });
 } catch {
@@ -14,8 +13,9 @@ try {
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
   PORT: z.coerce.number().int().positive().default(3000),
-  DATABASE_URL: z.string().min(1, 'DATABASE_URL wajib diisi'),
-  EXTERNAL_API_BASE_URL: z.string().url().optional(),
+  // Dibuat opsional agar server TIDAK CRASH jika lupa diisi di dashboard hosting
+  DATABASE_URL: z.string().optional(),
+  EXTERNAL_API_BASE_URL: z.string().url().optional().or(z.literal('')),
   API_RATE_LIMIT_PER_MINUTE: z.coerce.number().int().positive().default(8),
   CACHE_DEFAULT_TTL: z.coerce.number().int().positive().default(1800),
   FORYOU_TTL: z.coerce.number().int().positive().default(1800),
@@ -24,12 +24,8 @@ const envSchema = z.object({
   SEARCH_TTL: z.coerce.number().int().positive().default(1800),
   DETAIL_TTL: z.coerce.number().int().positive().default(3600),
   CONTOH_EXECUTE_DIR: z.string().default(''),
-  // ScraperAPI (rotasi IP terkelola): dipakai request keluar saat mode live.
-  // `https://api.scraperapi.com/?api_key=...&url=<target>` — tanpa key → jalur langsung.
   SCRAPERAPI_API_KEY: z.string().optional(),
-  // paksa mode fixture (TANPA jaringan) meski EXTERNAL_API_BASE_URL terisi — dipakai smoke test.
   EXTERNAL_FIXTURE: z.string().optional(),
-  // Base URL publik backend (dipakai rewire host stream proxy MovieBox).
   PUBLIC_BASE_URL: z.string().url().default('http://localhost:3000'),
 });
 
@@ -45,19 +41,27 @@ function resolveContohDir(): string {
     try {
       if (fs.existsSync(dir)) return dir;
     } catch {
-      // abaikan, coba kandidat berikutnya
+      // abaikan
     }
   }
   return candidates[0] ?? '../CONTOHEXECUTE';
 }
 
-const parsed = envSchema.parse(process.env);
+// GUNAKAN safeParse ALIH-ALIH parse
+const parsedResult = envSchema.safeParse(process.env);
+
+if (!parsedResult.success) {
+  console.error('❌ FATAL: Validasi Environment Variables Gagal!');
+  console.error(JSON.stringify(parsedResult.error.format(), null, 2));
+  process.exit(1);
+}
+
+const parsed = parsedResult.data;
 
 export const config = {
   ...parsed,
   isProduction: parsed.NODE_ENV === 'production',
   kontohDir: resolveContohDir(),
-  // fixture = mode demo aman (tanpa jaringan), kecuali user eksplisit memaksa live.
   useFixture: !parsed.EXTERNAL_API_BASE_URL || parsed.EXTERNAL_FIXTURE === '1',
 };
 

@@ -5,7 +5,7 @@
   "description": "Backend API untuk aplikasi streaming drama (mirror Sansekai API, database-first)",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.18.0"
   },
   "scripts": {
     "dev": "tsx watch src/index.ts",
@@ -29,8 +29,8 @@
   },
   "devDependencies": {
     "@types/node": "^22.10.5",
+    "prisma": "^8.0.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3"
-    "prisma": "^8.0.0",
   }
 }
